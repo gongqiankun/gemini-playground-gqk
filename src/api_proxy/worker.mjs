@@ -149,31 +149,30 @@ async function handleEmbeddings (req, apiKey) {
 
 // 在 handleCompletions 函数之后，添加这个全新的函数
 
+// 找到你之前添加的 handleImageGenerations 函数，然后用下面的代码完整地替换它。
+
 async function handleImageGenerations(req, apiKey) {
-  // 必须使用支持图像生成的模型
-  const model = req.model; 
+  const model = req.model;
   if (!model || !model.includes("image-generation")) {
     throw new HttpError("请使用一个支持图像生成的模型，例如 'gemini-2.0-flash-preview-image-generation'", 400);
   }
 
-  // Google 的图像生成 API 依然是 generateContent 端点
+  // API 端点保持不变
   const url = `${BASE_URL}/${API_VERSION}/models/${model}:generateContent`;
 
-  // 将 OpenAI 的请求格式转换为 Google 的格式
-  // Gemini 通过 "tool" 来调用图像生成功能
+  // ===================== 关键修改在这里 =====================
+  // 我们不再使用复杂的 'tools' 结构，而是像发送普通聊天一样发送 prompt。
   const googleReqBody = {
-    "tools": [{
-      "code_execution": {
-        "instruction": req.prompt, // prompt 告诉工具要画什么
-        "inputs": {
-          "n": req.n || 1, // 图片数量
-          "size": req.size || "1024x1024", // 图片尺寸
-          "quality": req.quality || "standard" // 图片质量
-        }
-      }
+    "contents": [{
+      "parts": [{ "text": req.prompt }]
     }],
-    safetySettings, 
+    // 我们可以将 OpenAI 的 'n' 参数映射到 Google 的 'candidateCount'
+    "generationConfig": {
+      "candidateCount": req.n || 1,
+    },
+    safetySettings,
   };
+  // =========================================================
   
   const response = await fetch(url, {
     method: "POST",
@@ -185,26 +184,27 @@ async function handleImageGenerations(req, apiKey) {
   if (response.ok) {
     const googleRes = await response.json();
     
-    // 检查响应中是否包含预期的图像数据
-    const parts = googleRes.candidates?.[0]?.content?.parts;
-    if (!parts || !parts.some(p => p.executable_code_result)) {
-      console.error("从 Google API 收到意外的响应:", JSON.stringify(googleRes, null, 2));
-      throw new HttpError("生成图像失败，上游 API 返回了意外的响应。", 500);
+    // ================== 响应解析逻辑也需要修改 ==================
+    // 图像数据通常在 'parts' 数组中的 'inlineData' 对象里
+    const candidates = googleRes.candidates;
+    if (!candidates || candidates.length === 0) {
+      console.error("从 Google API 收到意外的响应（无候选内容）:", JSON.stringify(googleRes, null, 2));
+      throw new HttpError("生成图像失败，上游 API 未返回有效的候选内容。", 500);
     }
     
-    // 将 Google 的响应转换回 OpenAI 的格式
     body = JSON.stringify({
       created: Math.floor(Date.now() / 1000),
-      data: parts
-        .filter(p => p.executable_code_result && p.executable_code_result.outputs)
-        .flatMap(p => p.executable_code_result.outputs)
-        .filter(output => output.b64_encoded_image)
-        .map(output => ({
-          // OpenAI 规范使用 b64_json 字段来接收 base64 编码的图片
-          b64_json: output.b64_encoded_image, 
-          revised_prompt: req.prompt // Gemini 不会修改 prompt，我们返回原始的
+      data: candidates.flatMap(cand => cand.content.parts)
+        .filter(part => part.inlineData && part.inlineData.mimeType.startsWith('image/'))
+        .map(part => ({
+          b64_json: part.inlineData.data,
+          revised_prompt: req.prompt
         }))
     });
+    // =============================================================
+  } else {
+    // 如果响应不 OK，直接将 Google 的错误信息透传回去，方便调试
+    body = await response.text();
   }
 
   return new Response(body, fixCors(response));
